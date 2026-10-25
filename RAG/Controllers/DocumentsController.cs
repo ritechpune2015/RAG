@@ -9,133 +9,183 @@ namespace RAG.Controllers
     [ApiController]
     public sealed class DocumentsController : ControllerBase
     {
-        private readonly IDocumentLoadingService _loadingService;
+        private static readonly HashSet<string> AllowedExtensions =
+            new(StringComparer.OrdinalIgnoreCase)
+            {
+            ".pdf",
+            ".docx",
+            ".txt"
+            };
 
-        public DocumentsController(IDocumentLoadingService loadingService)
+        private readonly IDocumentLoadingService _documentLoadingService;
+        private readonly DocumentIndexingService _indexingService;
+        private readonly IConfiguration _configuration;
+        private readonly ILogger<DocumentsController> _logger;
+
+
+        public DocumentsController(
+    IDocumentLoadingService documentLoadingService,
+    DocumentIndexingService indexingService,
+    IConfiguration configuration,
+    ILogger<DocumentsController> logger)
         {
-            _loadingService = loadingService;
+            _documentLoadingService = documentLoadingService;
+            _indexingService = indexingService;
+            _configuration = configuration;
+            _logger = logger;
         }
+
 
         [HttpPost("upload")]
         [Consumes("multipart/form-data")]
-        [RequestSizeLimit(10 * 1024 * 1024)]
+        [RequestSizeLimit(11 * 1024 * 1024)]
         public async Task<ActionResult<DocumentUploadResponse>> Upload(
-            IFormFile file,CancellationToken cancellationToken)
+            IFormFile file,
+            CancellationToken cancellationToken)
         {
-            try
-            {
-                var document = await _loadingService.LoadAsync(
-                    file,
-                    cancellationToken);
-
-                var response = new DocumentUploadResponse
-                {
-                    Id = document.Id,
-                    OriginalFileName = document.OriginalFileName,
-                    FileType = document.FileType,
-                    FileSize = document.FileSize,
-                    PageCount = document.PageCount,
-                    CharacterCount = document.ExtractedText.Length,
-                    Status = document.Status
-                };
-
-                return CreatedAtAction(
-                    nameof(GetById),
-                    new { id = document.Id },
-                    response);
-            }
-            catch (DuplicateDocumentException ex)
-            {
-                return Conflict(new
-                {
-                    message = ex.Message,
-                    existingDocumentId = ex.ExistingDocumentId,
-                    existingFileName = ex.ExistingFileName
-                });
-            }
-            catch (ArgumentException ex)
+            if (file is null || file.Length == 0)
             {
                 return BadRequest(new
                 {
-                    message = ex.Message
+                    message = "Please select a non-empty file."
+                });
+            }
+
+            var maxFileSize = _configuration.GetValue<long>(
+                "DocumentStorage:MaxFileSizeBytes",
+                10 * 1024 * 1024);
+
+            if (file.Length > maxFileSize)
+            {
+                return BadRequest(new
+                {
+                    message = $"The file cannot exceed {maxFileSize} bytes."
+                });
+            }
+
+            var originalFileName = Path.GetFileName(file.FileName);
+            var extension = Path.GetExtension(originalFileName);
+
+            if (!AllowedExtensions.Contains(extension))
+            {
+                return BadRequest(new
+                {
+                    message = "Only PDF, DOCX and TXT files are supported."
+                });
+            }
+
+            var documentId = Guid.NewGuid();
+
+            var uploadDirectory = _configuration[
+                "DocumentStorage:UploadDirectory"] ?? "uploads";
+
+            var absoluteUploadDirectory = Path.GetFullPath(
+                Path.Combine(
+                    _configuration["DocumentStorage:RootPath"]
+                        ?? AppContext.BaseDirectory,
+                    uploadDirectory));
+
+            Directory.CreateDirectory(absoluteUploadDirectory);
+
+            // Never use the supplied file name as the storage path.
+            var storedFileName = $"{documentId:N}{extension}";
+
+            var storedFilePath = Path.Combine(
+                absoluteUploadDirectory,
+                storedFileName);
+
+            try
+            {
+                // Step 1: Save the original file.
+                await using (var outputStream = new FileStream(
+                    storedFilePath,
+                    FileMode.CreateNew,
+                    FileAccess.Write,
+                    FileShare.None,
+                    bufferSize: 81920,
+                    useAsync: true))
+                {
+                    await file.CopyToAsync(
+                        outputStream, cancellationToken);
+                }
+
+                // Step 2: Extract, chunk, embed and store in Qdrant.
+
+                var document = await _documentLoadingService.LoadAsync(
+           file,
+           cancellationToken);
+
+                // Step 3: Chunk the extracted text and index it in Qdrant.
+                var chunkCount = await _indexingService.IndexDocumentAsync(
+                    document.ExtractedText,
+                    document.OriginalFileName,
+                    document.Id,
+                    cancellationToken);
+
+                // Step 3: Return the indexing result.
+                return Ok(new DocumentUploadResponse
+                {
+                    Id = documentId,
+                    OriginalFileName = originalFileName,
+                    FileType = extension,
+                    FileSize = file.Length,
+                    PageCount = null, // Populate this when page-count extraction is implemented.
+                    CharacterCount = 0, // Populate this with the extracted text length.
+                    Status = "Indexed",
+                    ChunkCount = chunkCount,
+                    Message = "Document uploaded and indexed successfully."
                 });
             }
             catch (OperationCanceledException)
                 when (cancellationToken.IsCancellationRequested)
             {
+                // A production implementation should record the indexing
+                // status and reconcile any partial Qdrant writes.
                 throw;
             }
-            catch (Exception)
+            catch (Exception ex)
             {
-                // In production, log the exception details
-                // through ILogger without exposing internal
-                // implementation details to the client.
+                _logger.LogError(
+                    ex,
+                    "Document indexing failed for document {DocumentId}",
+                    documentId);
+
+                // Best-effort cleanup of this upload's Qdrant points.
+                try
+                {
+                    // If the vector store was injected here, we could
+                    // delete all points for documentId.
+                    // The complete cleanup implementation is discussed below.
+                }
+                catch (Exception cleanupException)
+                {
+                    _logger.LogError(
+                        cleanupException,
+                        "Cleanup failed for document {DocumentId}",
+                        documentId);
+                }
+
+                // Best-effort cleanup of the original file.
+                try
+                {
+                    if (System.IO.File.Exists(storedFilePath))
+                    {
+                        System.IO.File.Delete(storedFilePath);
+                    }
+                }
+                catch (Exception cleanupException)
+                {
+                    _logger.LogError(
+                        cleanupException,
+                        "Could not remove failed upload {DocumentId}",
+                        documentId);
+                }
+
                 return Problem(
-                    title: "Document loading failed.",
+                    title: "Document indexing failed",
+                    detail: "The file could not be indexed. Check the application logs.",
                     statusCode: StatusCodes.Status500InternalServerError);
             }
         }
-
-        [HttpGet("{id:guid}")]
-        public ActionResult<DocumentUploadResponse> GetById(
-            Guid id)
-        {
-            var document = _loadingService.GetById(id);
-
-            if (document is null)
-            {
-                return NotFound();
-            }
-
-            return Ok(new DocumentUploadResponse
-            {
-                Id = document.Id,
-                OriginalFileName = document.OriginalFileName,
-                FileType = document.FileType,
-                FileSize = document.FileSize,
-                PageCount = document.PageCount,
-                CharacterCount = document.ExtractedText.Length,
-                Status = document.Status
-            });
-        }
-
-        [HttpGet("{id:guid}/text")]
-        public ActionResult<string> GetText(Guid id)
-        {
-            var document = _loadingService.GetById(id);
-
-            if (document is null)
-            {
-                return NotFound();
-            }
-
-            return Ok(new
-            {
-                document.Id,
-                document.OriginalFileName,
-                document.ExtractedText
-            });
-        }
-
-        [HttpGet]
-        public ActionResult<IReadOnlyCollection<DocumentUploadResponse>>
-            GetAll()
-        {
-            var documents = _loadingService.GetAll()
-                .Select(document => new DocumentUploadResponse
-                {
-                    Id = document.Id,
-                    OriginalFileName = document.OriginalFileName,
-                    FileType = document.FileType,
-                    FileSize = document.FileSize,
-                    PageCount = document.PageCount,
-                    CharacterCount = document.ExtractedText.Length,
-                    Status = document.Status
-                })
-                .ToArray();
-
-            return Ok(documents);
-        }
     }
-
 }

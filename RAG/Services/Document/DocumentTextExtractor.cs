@@ -8,154 +8,130 @@ using UglyToad.PdfPig;
 
 namespace RAG.Services.Document
 {
-    public sealed class DocumentTextExtractor: IDocumentTextExtractor
+    public sealed class DocumentTextExtractor : IDocumentTextExtractor
     {
-        public Task<DocumentExtractionResult> ExtractAsync(string fileName,
-            byte[] fileContent, CancellationToken cancellationToken)
-        {
-            cancellationToken.ThrowIfCancellationRequested();
-
-            var extension = System.IO.Path.GetExtension(fileName).ToLowerInvariant();
-
-            DocumentExtractionResult result = extension switch
+            public Task<DocumentExtractionResult> ExtractAsync(
+                string fileName,
+                byte[] fileBytes,
+                CancellationToken cancellationToken = default)
             {
-                ".pdf" => ExtractPdf(fileContent),
+                ArgumentException.ThrowIfNullOrWhiteSpace(fileName);
+                ArgumentNullException.ThrowIfNull(fileBytes);
 
-                ".docx" => ExtractDocx(fileContent),
-
-                ".txt" => ExtractTxt(fileContent),
-
-                ".html" or ".htm" => ExtractHtml(fileContent),
-
-                _ => throw new ArgumentException(
-                    "Unsupported document format.")
-            };
-
-            result.Text = CleanText(result.Text);
-
-            return Task.FromResult(result);
-        }
-
-        private static DocumentExtractionResult ExtractPdf(byte[] fileContent)
-        {
-            using var stream = new MemoryStream(fileContent);
-
-            using var pdf = PdfDocument.Open(stream);
-
-            var text = new StringBuilder();
-
-            foreach (var page in pdf.GetPages())
-            {
-                text.AppendLine(page.Text);
-            }
-
-            return new DocumentExtractionResult
-            {
-                Text = text.ToString(),
-                PageCount = pdf.NumberOfPages
-            };
-        }
-
-        private static DocumentExtractionResult ExtractDocx(byte[] fileContent)
-        {
-            using var stream = new MemoryStream(fileContent);
-
-            using var document =
-                WordprocessingDocument.Open(stream, false);
-
-            var body = document.MainDocumentPart?.Document.Body;
-
-            if (body is null)
-            {
-                return new DocumentExtractionResult();
-            }
-
-            var text = new StringBuilder();
-
-            foreach (var element in body.Elements())
-            {
-                if (element is Paragraph paragraph)
+                if (fileBytes.Length == 0)
                 {
-                    text.AppendLine(paragraph.InnerText);
+                    throw new ArgumentException(
+                        "File content cannot be empty.",
+                        nameof(fileBytes));
                 }
-                else if (element is Table table)
+
+                cancellationToken.ThrowIfCancellationRequested();
+
+                var extension = System.IO.Path.GetExtension(fileName)
+                    .ToLowerInvariant();
+
+                DocumentExtractionResult result = extension switch
                 {
-                    foreach (var row in table.Elements<TableRow>())
-                    {
-                        var cells = row.Elements<TableCell>()
-                            .Select(cell => cell.InnerText);
+                    ".pdf" => ExtractPdf(fileBytes),
+                    ".docx" => ExtractDocx(fileBytes),
+                    ".txt" => ExtractTxt(fileBytes),
+                    ".html" or ".htm" => ExtractHtml(fileBytes),
 
-                        text.AppendLine(
-                            string.Join(" | ", cells));
-                    }
-                }
-            }
+                    _ => throw new NotSupportedException(
+                        $"File type '{extension}' is not supported.")
+                };
 
-            return new DocumentExtractionResult
-            {
-                Text = text.ToString()
-            };
-        }
+                cancellationToken.ThrowIfCancellationRequested();
 
-        private static DocumentExtractionResult ExtractTxt(byte[] fileContent)
-        {
-            var text = Encoding.UTF8.GetString(fileContent);
-
-            return new DocumentExtractionResult
-            {
-                Text = text
-            };
-        }
-
-        private static DocumentExtractionResult ExtractHtml(byte[] fileContent)
-        {
-            var html = Encoding.UTF8.GetString(fileContent);
-
-            var htmlDocument = new HtmlDocument();
-
-            htmlDocument.LoadHtml(html);
-
-            // Remove elements that usually do not contain
-            // useful document content.
-            var unwantedNodes = htmlDocument.DocumentNode.SelectNodes(
-                "//script|//style|//noscript");
-
-            if (unwantedNodes is not null)
-            {
-                foreach (var node in unwantedNodes)
+                if (string.IsNullOrWhiteSpace(result.Text))
                 {
-                    node.Remove();
+                    throw new InvalidOperationException(
+                        "No readable text was found in the document.");
                 }
+
+                return Task.FromResult(result);
             }
 
-            var text = HtmlEntity.DeEntitize(
-                htmlDocument.DocumentNode.InnerText);
-
-            return new DocumentExtractionResult
+            private static DocumentExtractionResult ExtractPdf(
+                byte[] fileBytes)
             {
-                Text = text
-            };
-        }
+                using var stream = new MemoryStream(fileBytes);
+                using var pdf = PdfDocument.Open(stream);
 
-        private static string CleanText(string text)
-        {
-            if (string.IsNullOrWhiteSpace(text))
-            {
-                return string.Empty;
+                var builder = new StringBuilder();
+
+                foreach (var page in pdf.GetPages())
+                {
+                    builder.AppendLine(page.Text);
+                }
+
+                return new DocumentExtractionResult
+                {
+                    Text = builder.ToString(),
+                    PageCount = pdf.NumberOfPages
+                };
             }
 
-            // Normalize line endings.
-            text = text.Replace("\r\n", "\n")
-                       .Replace("\r", "\n");
+            private static DocumentExtractionResult ExtractDocx(
+                byte[] fileBytes)
+            {
+                using var stream = new MemoryStream(fileBytes);
 
-            // Replace tabs and repeated spaces.
-            text = Regex.Replace(text, @"[ \t]+", " ");
+                using var document =
+                    WordprocessingDocument.Open(stream, false);
 
-            // Remove excessive blank lines.
-            text = Regex.Replace(text, @"\n{3,}", "\n\n");
+                var body = document.MainDocumentPart?
+                    .Document?
+                    .Body;
 
-            return text.Trim();
+                return new DocumentExtractionResult
+                {
+                    Text = body?.InnerText ?? string.Empty,
+                    PageCount = null
+                };
+            }
+
+            private static DocumentExtractionResult ExtractTxt(
+                byte[] fileBytes)
+            {
+                return new DocumentExtractionResult
+                {
+                    Text = Encoding.UTF8.GetString(fileBytes),
+                    PageCount = null
+                };
+            }
+
+            private static DocumentExtractionResult ExtractHtml(
+                byte[] fileBytes)
+            {
+                var html = Encoding.UTF8.GetString(fileBytes);
+
+                // Basic HTML-to-text conversion for demonstration.
+                html = Regex.Replace(
+                    html,
+                    @"<(script|style)\b[^>]*>.*?</\1>",
+                    " ",
+                    RegexOptions.IgnoreCase |
+                    RegexOptions.Singleline);
+
+                html = Regex.Replace(
+                    html,
+                    @"<\s*br\s*/?\s*>|</\s*(p|div|li|h[1-6]|tr)\s*>",
+                    "\n",
+                    RegexOptions.IgnoreCase);
+
+                html = Regex.Replace(html, @"<[^>]+>", " ");
+
+                html = System.Net.WebUtility.HtmlDecode(html);
+
+                html = Regex.Replace(html, @"[ \t]+", " ");
+                html = Regex.Replace(html, @"\n\s*\n+", "\n\n");
+
+                return new DocumentExtractionResult
+                {
+                    Text = html.Trim(),
+                    PageCount = null
+                };
+            }
         }
     }
-
-}
